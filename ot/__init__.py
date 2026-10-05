@@ -80,6 +80,7 @@ from .gromov import (
     gromov_barycenters,
     fused_gromov_wasserstein,
     fused_gromov_wasserstein2,
+    sliced_fused_gromov_wasserstein,
     lowrank_gromov_wasserstein_samples,
 )
 from .weak import weak_optimal_transport
@@ -142,6 +143,7 @@ __all__ = [
     "gromov_barycenters",
     "fused_gromov_wasserstein",
     "fused_gromov_wasserstein2",
+    "sliced_fused_gromov_wasserstein",
     "max_sliced_wasserstein_distance",
     "weak_optimal_transport",
     "factored_optimal_transport",
