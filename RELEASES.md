@@ -4,6 +4,7 @@
 
 #### New features
 
+- Add Sliced Fused Gromov-Wasserstein distance in `ot.gromov.sliced_fused_gromov_wasserstein` ([arXiv:2508.02364](https://arxiv.org/abs/2508.02364)) (PR #XXX)
 - Use `ot.utils.check_marginal` (and shape-tuple support in `ot.utils.unif`) to fill and validate default marginals consistently across solvers (Gromov, low-rank, stochastic, barycenter, factored) (PR #856)
 - Add stereographic spherical sliced Wasserstein distance in `ot.sliced.stereographic_sliced_wasserstein_sphere`, with its rotationally invariant extension (PR #836)
 - Add Quasi-Monte Carlo sliced Wasserstein sampling (QSW/RQSW) via generalized

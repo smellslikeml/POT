@@ -37,6 +37,10 @@ from ._gw import (
     fgw_barycenters,
 )
 
+from ._sliced import (
+    sliced_fused_gromov_wasserstein,
+)
+
 from ._bregman import (
     entropic_gromov_wasserstein,
     entropic_gromov_wasserstein2,
@@ -133,6 +137,7 @@ __all__ = [
     "solve_gromov_linesearch",
     "gromov_barycenters",
     "fgw_barycenters",
+    "sliced_fused_gromov_wasserstein",
     "entropic_gromov_wasserstein",
     "entropic_gromov_wasserstein2",
     "BAPG_gromov_wasserstein",
