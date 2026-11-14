@@ -25,11 +25,14 @@ from ._utils import (
     fused_unbalanced_across_spaces_cost,
     uot_cost_matrix,
     uot_parameters_and_measures,
+    proj_transport_polytope,
 )
 
 from ._gw import (
     gromov_wasserstein,
     gromov_wasserstein2,
+    gromov_wasserstein_ipg,
+    gromov_wasserstein_ipg2,
     fused_gromov_wasserstein,
     fused_gromov_wasserstein2,
     solve_gromov_linesearch,
@@ -128,6 +131,9 @@ __all__ = [
     "uot_parameters_and_measures",
     "gromov_wasserstein",
     "gromov_wasserstein2",
+    "gromov_wasserstein_ipg",
+    "gromov_wasserstein_ipg2",
+    "proj_transport_polytope",
     "fused_gromov_wasserstein",
     "fused_gromov_wasserstein2",
     "solve_gromov_linesearch",

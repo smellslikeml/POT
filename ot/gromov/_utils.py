@@ -354,6 +354,281 @@ def gwggrad(constC, hC1, hC2, T, nx=None):
     return 2 * tensor_product(constC, hC1, hC2, T, nx)  # [12] Prop. 2 misses a 2 factor
 
 
+def _spectral_norm(C, nx=None):
+    r"""Return the spectral norm (largest singular value) of a square matrix.
+
+    The norm is computed from eigendecompositions provided by the backend
+    (:code:`nx.eigh`) so that the function works on arrays from all compatible
+    backends. Symmetric matrices are handled directly through the eigenvalues
+    of :math:`\mathbf{C}`, while for general matrices the eigenvalues of the
+    symmetric matrix :math:`\mathbf{C}^T \mathbf{C}` are used:
+
+    .. math::
+        \|\mathbf{C}\|_2 = \max_i |\lambda_i(\mathbf{C})|
+        \quad \text{if } \mathbf{C} = \mathbf{C}^T, \qquad
+        \|\mathbf{C}\|_2 = \sqrt{\lambda_{\max}(\mathbf{C}^T \mathbf{C})}
+        \quad \text{otherwise.}
+
+    Parameters
+    ----------
+    C : array-like, shape (n, n)
+        Square matrix.
+    nx : backend, optional
+        If let to its default value None, a backend test will be conducted.
+
+    Returns
+    -------
+    norm : array-like
+        Spectral norm :math:`\|\mathbf{C}\|_2` of the matrix.
+    """
+    if nx is None:
+        C = list_to_array(C)
+        nx = get_backend(C)
+
+    if nx.allclose(C, C.T, atol=1e-10):
+        eigvals = nx.eigh(C)[0]
+        return nx.max(nx.abs(eigvals))
+
+    eigvals = nx.eigh(nx.dot(C.T, C))[0]
+    return nx.sqrt(nx.maximum(nx.max(eigvals), 0.0))
+
+
+def _project(
+    Tin,
+    p,
+    q,
+    y0,
+    max_iter,
+    tol,
+    nx=None,
+    accelerated=True,
+    restart=True,
+    restart_iter=500,
+    lr_const=2.0,
+    return_err=False,
+):
+    r"""(internal) Project a matrix onto the transport polytope of :math:`(\mathbf{p}, \mathbf{q})`.
+
+    Euclidean projection of :math:`\mathbf{T}_{in}` (which need not be
+    nonnegative) onto :math:`\{\mathbf{T} \geq 0: \mathbf{T}\mathbf{1} = \mathbf{p},
+    \mathbf{T}^T\mathbf{1} = \mathbf{q}\}` using Nesterov-accelerated gradient
+    ascent on the smooth dual of the projection problem, as described in [97]_.
+
+    Parameters
+    ----------
+    Tin : array-like, shape (ns, nt)
+        Matrix to project onto the transport polytope.
+    p : array-like, shape (ns,)
+        Probability distribution in the source space.
+    q : array-like, shape (nt,)
+        Probability distribution in the target space.
+    y0 : array-like, shape (ns + nt,), optional
+        Initial dual potentials (row then column), used for warm starting.
+    max_iter : int
+        Maximum number of dual gradient iterations.
+    tol : float
+        Stopping target for the marginal residual; the dual iterate stops when
+        the residual is below ``tol / (6 + norm(y))``.
+    nx : backend, optional
+        If let to its default value None, a backend test will be conducted.
+    accelerated : bool, optional
+        Use Nesterov acceleration of the dual gradient ascent (default True).
+    restart : bool, optional
+        Use periodic momentum restarts (default True).
+    restart_iter : int, optional
+        Restart interval for the momentum (default 500).
+    lr_const : float, optional
+        Dual step size is ``lr_const / (ns + nt)`` (default 2., the practical
+        value used in the reference implementation; use at most 1 for the safe
+        Lipschitz step of the accelerated dual).
+    return_err : bool, optional
+        Also return the residual trajectory of the dual iterations.
+
+    Returns
+    -------
+    T : array-like, shape (`ns`, `nt`)
+        Approximate Euclidean projection of `Tin` onto the polytope.
+    y : array-like, shape (ns + nt,)
+        Final dual potentials, that can be used to warm start another call.
+    stats : dict
+        Convergence information with keys ``n_iter``, ``converged``,
+        ``final_err`` and ``threshold`` (and ``err`` when `return_err` is True).
+    """
+    if nx is None:
+        Tin, p, q = list_to_array(Tin, p, q)
+        nx = get_backend(Tin, p, q)
+
+    m, n = Tin.shape
+    lr = lr_const / (m + n)
+    if y0 is None:
+        y = nx.zeros(m + n, type_as=Tin)
+    else:
+        y = nx.copy(y0)
+    z = nx.copy(y)
+    t = 1.0
+
+    err_traj = [] if return_err else None
+
+    k = -1
+    for k in range(max_iter):
+        Tz = nx.maximum(Tin + z[:m, None] + z[None, m:], 0.0)
+        grad = nx.concatenate([nx.sum(Tz, 1) - p, nx.sum(Tz, 0) - q])
+        err = nx.norm(grad)
+        normz = nx.norm(z)
+
+        if return_err:
+            err_traj.append(err)
+
+        if err <= tol / (6.0 + normz):
+            y = z
+            break
+
+        y_next = z - lr * grad
+        t_next = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t)) if accelerated else t
+        if restart and (k + 1) % restart_iter == 0:
+            t = t_next = 1.0
+        beta = (t - 1.0) / t_next
+        z = y_next + beta * (y_next - y)
+        y, t = y_next, t_next
+
+    Tproj = nx.maximum(Tin + y[:m, None] + y[None, m:], 0.0)
+    grad = nx.concatenate([nx.sum(Tproj, 1) - p, nx.sum(Tproj, 0) - q])
+    final_err = float(nx.to_numpy(nx.norm(grad)))
+    threshold = tol / (6.0 + float(nx.to_numpy(nx.norm(y))))
+    stats = {
+        "n_iter": k + 1,
+        "converged": final_err <= threshold,
+        "final_err": final_err,
+        "threshold": threshold,
+    }
+    if return_err:
+        stats["err"] = err_traj
+
+    return Tproj, y, stats
+
+
+def proj_transport_polytope(
+    Tin,
+    p,
+    q,
+    y0=None,
+    max_iter=1000,
+    tol=1e-9,
+    accelerated=True,
+    restart=True,
+    restart_iter=500,
+    lr_const=2.0,
+    log=False,
+    nx=None,
+):
+    r"""Projection onto the transport polytope of distributions :math:`(\mathbf{p}, \mathbf{q})`.
+
+    Returns the (approximate) Euclidean projection of :math:`\mathbf{T}_{in}`
+    onto the set :math:`\{\mathbf{T} \geq 0: \mathbf{T}\mathbf{1} = \mathbf{p},
+    \mathbf{T}^T\mathbf{1} = \mathbf{q}\}`, solved with Nesterov-accelerated
+    gradient ascent on the smooth dual of the projection problem [97]_. The
+    dual problem is a concave quadratic maximization with Lipschitz gradient
+    whose iterates read :math:`\mathbf{T}(\mathbf{y}) = \max(\mathbf{T}_{in} +
+    \mathbf{y}_{rows} + \mathbf{y}_{cols}, 0)` for dual potentials
+    :math:`\mathbf{y}`.
+
+    This projection is the inner solver of the inexact projected-gradient
+    Gromov-Wasserstein solver :func:`ot.gromov.gromov_wasserstein_ipg` but can
+    also be used standalone.
+
+    .. note:: This function is backend-compatible and will work on arrays from
+        all compatible backends.
+
+    Parameters
+    ----------
+    Tin : array-like, shape (ns, nt)
+        Matrix to project; it need not be nonnegative.
+    p : array-like, shape (ns,)
+        Probability distribution in the source space.
+    q : array-like, shape (nt,)
+        Probability distribution in the target space.
+    y0 : array-like, shape (ns + nt,), optional
+        Initial dual potentials (row then column), used for warm starting.
+        If let to its default value None, a zero start is taken.
+    max_iter : int, optional
+        Maximum number of dual gradient iterations (default 1000).
+    tol : float, optional
+        Stopping target for the marginal residual; the dual iterates stop when
+        the residual is below ``tol / (6 + norm(y))`` (default 1e-9).
+    accelerated : bool, optional
+        Use Nesterov acceleration of the dual gradient ascent (default True).
+    restart : bool, optional
+        Use periodic momentum restarts (default True).
+    restart_iter : int, optional
+        Restart interval for the momentum (default 500).
+    lr_const : float, optional
+        Dual step size is ``lr_const / (ns + nt)`` (default 2., the practical
+        value used in the reference implementation; use at most 1 for the safe
+        Lipschitz step of the accelerated dual).
+    log : bool, optional
+        Record log if True.
+    nx : backend, optional
+        If let to its default value None, a backend test will be conducted.
+
+    Returns
+    -------
+    T : array-like, shape (`ns`, `nt`)
+        Approximate Euclidean projection of `Tin` onto the transport polytope.
+    log : dict
+        Projection information with keys ``y`` (dual potentials), ``err``
+        (residual trajectory), ``converged``, ``n_iter``, ``final_err``
+        and ``threshold``.
+
+    :ref:`[97] <references-proj-transport-polytope>`
+
+    .. _references-proj-transport-polytope:
+
+    References
+    ----------
+    .. [97] Liang, J., & Yang, R. "A Provably Convergent and Practical
+        Algorithm for Gromov-Wasserstein Optimal Transport". Advances in
+        Neural Information Processing Systems (NeurIPS), 2026.
+    """
+    arr = [Tin, p, q]
+    if y0 is not None:
+        arr.append(y0)
+
+    if nx is None:
+        arr = list_to_array(*arr)
+        nx = get_backend(*arr)
+
+    Tin, p, q = arr[0], arr[1], arr[2]
+    y0 = arr[3] if len(arr) > 3 else None
+
+    Tproj, y, stats = _project(
+        Tin,
+        p,
+        q,
+        y0,
+        max_iter,
+        tol,
+        nx=nx,
+        accelerated=accelerated,
+        restart=restart,
+        restart_iter=restart_iter,
+        lr_const=lr_const,
+        return_err=log,
+    )
+
+    if log:
+        log = {
+            "y": y,
+            "err": stats["err"],
+            "converged": stats["converged"],
+            "n_iter": stats["n_iter"],
+            "final_err": stats["final_err"],
+            "threshold": stats["threshold"],
+        }
+        return Tproj, log
+
+    return Tproj
+
+
 def init_matrix_semirelaxed(C1, C2, p, loss_fun="square_loss", nx=None):
     r"""Return loss matrices and tensors for semi-relaxed Gromov-Wasserstein fast computation
 

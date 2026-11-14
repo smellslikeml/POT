@@ -1422,3 +1422,262 @@ def test_fgw_barycenter(nx):
 
     np.testing.assert_allclose(C, Cb, atol=1e-06)
     np.testing.assert_allclose(X, Xb, atol=1e-06)
+
+
+def test_gromov_ipg(nx):
+    n_samples = 20  # nb samples
+    mu_s = np.array([0, 0])
+    cov_s = np.array([[1, 0], [0, 1]])
+
+    xs = ot.datasets.make_2D_samples_gauss(n_samples, mu_s, cov_s, random_state=1)
+    xt = xs[::-1].copy()
+
+    p = ot.unif(n_samples)
+    q = ot.unif(n_samples)
+
+    C1 = ot.dist(xs, xs)
+    C2 = ot.dist(xt, xt)
+
+    C1 /= C1.max()
+    C2 /= C2.max()
+
+    C1b, C2b, pb, qb = nx.from_numpy(C1, C2, p, q)
+
+    # reference coupling from the conditional gradient solver
+    G = ot.gromov.gromov_wasserstein(C1, C2, p, q, "square_loss")
+
+    G_ipg = nx.to_numpy(
+        ot.gromov.gromov_wasserstein_ipg(
+            C1b,
+            C2b,
+            pb,
+            qb,
+            "square_loss",
+            max_iter=1000,
+            max_iter_proj=1000,
+            proj_lr_const=1.0,
+        )
+    )
+    G_ipg_np, log = ot.gromov.gromov_wasserstein_ipg(
+        C1,
+        C2,
+        p,
+        q,
+        "square_loss",
+        max_iter=1000,
+        max_iter_proj=1000,
+        proj_lr_const=1.0,
+        log=True,
+    )
+
+    # backend parity
+    np.testing.assert_allclose(G_ipg, G_ipg_np, atol=1e-06)
+
+    # check marginal constraints (convergence of the solver)
+    np.testing.assert_allclose(p, G_ipg.sum(1), atol=1e-04)
+    np.testing.assert_allclose(q, G_ipg.sum(0), atol=1e-04)
+
+    # known optimum: reversed samples match through the anti-identity coupling
+    Id = (1 / (1.0 * n_samples)) * np.eye(n_samples, n_samples)
+    np.testing.assert_allclose(G_ipg, np.flipud(Id), atol=1e-04)
+
+    # parity with the conditional gradient solver
+    np.testing.assert_allclose(G_ipg, G, atol=1e-04)
+    np.testing.assert_allclose(log["gw_dist"], 0.0, atol=1e-04)
+    np.testing.assert_allclose(log["T"], G_ipg_np, atol=1e-06)
+
+    # distance variant
+    gw_ipg = ot.gromov.gromov_wasserstein_ipg2(
+        C1,
+        C2,
+        p,
+        q,
+        "square_loss",
+        max_iter=1000,
+        max_iter_proj=1000,
+        proj_lr_const=1.0,
+    )
+    gwb_ipg = nx.to_numpy(
+        ot.gromov.gromov_wasserstein_ipg2(
+            C1b,
+            C2b,
+            pb,
+            qb,
+            "square_loss",
+            max_iter=1000,
+            max_iter_proj=1000,
+            proj_lr_const=1.0,
+            log=True,
+        )[0]
+    )
+
+    np.testing.assert_allclose(gw_ipg, gwb_ipg, atol=1e-06)
+    np.testing.assert_allclose(gwb_ipg, 0.0, atol=1e-04)
+
+
+def test_asymmetric_gromov_ipg(nx):
+    n_samples = 20
+    rng = np.random.RandomState(0)
+    C1 = rng.uniform(low=0.0, high=10, size=(n_samples, n_samples))
+    idx = np.arange(n_samples)
+    rng.shuffle(idx)
+    C2 = C1[idx, :][:, idx]
+
+    p = ot.unif(n_samples)
+    q = ot.unif(n_samples)
+
+    C1b, C2b, pb, qb = nx.from_numpy(C1, C2, p, q)
+
+    G, log = ot.gromov.gromov_wasserstein_ipg(
+        C1,
+        C2,
+        p,
+        q,
+        "square_loss",
+        symmetric=False,
+        max_iter=1000,
+        max_iter_proj=1000,
+        proj_lr_const=1.0,
+        log=True,
+    )
+    Gb, logb = ot.gromov.gromov_wasserstein_ipg(
+        C1b,
+        C2b,
+        pb,
+        qb,
+        "square_loss",
+        symmetric=False,
+        max_iter=1000,
+        max_iter_proj=1000,
+        proj_lr_const=1.0,
+        log=True,
+    )
+    Gb = nx.to_numpy(Gb)
+
+    # check constraints
+    np.testing.assert_allclose(G, Gb, atol=1e-06)
+    np.testing.assert_allclose(p, Gb.sum(1), atol=1e-04)
+    np.testing.assert_allclose(q, Gb.sum(0), atol=1e-04)
+
+    # known optimum: the coupling recovers the permutation up to which the
+    # costs agree, hence a vanishing gw loss
+    np.testing.assert_allclose(log["gw_dist"], 0.0, atol=1e-04)
+    np.testing.assert_allclose(nx.to_numpy(logb["gw_dist"]), 0.0, atol=1e-04)
+
+    gw, log = ot.gromov.gromov_wasserstein_ipg2(
+        C1,
+        C2,
+        p,
+        q,
+        "square_loss",
+        symmetric=False,
+        max_iter=1000,
+        max_iter_proj=1000,
+        proj_lr_const=1.0,
+        log=True,
+    )
+    gwb = nx.to_numpy(
+        ot.gromov.gromov_wasserstein_ipg2(
+            C1b,
+            C2b,
+            pb,
+            qb,
+            "square_loss",
+            symmetric=False,
+            max_iter=1000,
+            max_iter_proj=1000,
+            proj_lr_const=1.0,
+        )
+    )
+
+    np.testing.assert_allclose(gw, gwb, atol=1e-06)
+    np.testing.assert_allclose(gwb, 0.0, atol=1e-04)
+    np.testing.assert_allclose(nx.to_numpy(log["T"]), G, atol=1e-06)
+
+
+def test_proj_transport_polytope(nx):
+    rng = np.random.RandomState(0)
+    n, m = 6, 5
+    p = rng.uniform(size=n)
+    p /= p.sum()
+    q = rng.uniform(size=m)
+    q /= q.sum()
+    X = rng.randn(n, m)
+
+    Xb, pb, qb = nx.from_numpy(X, p, q)
+
+    T, log = ot.gromov.proj_transport_polytope(
+        X, p, q, tol=1e-9, max_iter=5000, log=True
+    )
+    Tb, logb = ot.gromov.proj_transport_polytope(
+        Xb, pb, qb, tol=1e-9, max_iter=5000, log=True
+    )
+    Tb = nx.to_numpy(Tb)
+
+    np.testing.assert_allclose(T, Tb, atol=1e-09)
+
+    # projection onto the polytope: marginals are satisfied and negative
+    # entries of X are clipped
+    np.testing.assert_allclose(T.sum(1), p, atol=1e-06)
+    np.testing.assert_allclose(T.sum(0), q, atol=1e-06)
+    assert T.min() >= 0.0
+    assert log["converged"]
+    assert logb["converged"]
+
+    # warm starting from the previous dual potentials solves it faster
+    T2, log2 = ot.gromov.proj_transport_polytope(
+        X, p, q, y0=log["y"], tol=1e-9, max_iter=5000, log=True
+    )
+    np.testing.assert_allclose(T2, T, atol=1e-06)
+    assert log2["converged"]
+    assert log2["n_iter"] <= log["n_iter"]
+
+
+def test_gromov_ipg_dtype_device(nx):
+    n_samples = 20  # nb samples
+    mu_s = np.array([0, 0])
+    cov_s = np.array([[1, 0], [0, 1]])
+
+    xs = ot.datasets.make_2D_samples_gauss(n_samples, mu_s, cov_s, random_state=4)
+    xt = xs[::-1].copy()
+
+    p = ot.unif(n_samples)
+    q = ot.unif(n_samples)
+
+    C1 = ot.dist(xs, xs)
+    C2 = ot.dist(xt, xt)
+
+    C1 /= C1.max()
+    C2 /= C2.max()
+
+    for tp in nx.__type_list__:
+        print(nx.dtype_device(tp))
+
+        C1b, C2b, pb, qb = nx.from_numpy(C1, C2, p, q, type_as=tp)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error")
+            Gb = ot.gromov.gromov_wasserstein_ipg(
+                C1b,
+                C2b,
+                pb,
+                qb,
+                "square_loss",
+                max_iter=500,
+                max_iter_proj=500,
+                proj_lr_const=1.0,
+            )
+            gw_valb = ot.gromov.gromov_wasserstein_ipg2(
+                C1b,
+                C2b,
+                pb,
+                qb,
+                "square_loss",
+                max_iter=500,
+                max_iter_proj=500,
+                proj_lr_const=1.0,
+                log=False,
+            )
+
+        nx.assert_same_dtype_device(C1b, Gb)
+        nx.assert_same_dtype_device(C1b, gw_valb)

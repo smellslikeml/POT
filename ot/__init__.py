@@ -77,6 +77,8 @@ from .sliced import (
 from .gromov import (
     gromov_wasserstein,
     gromov_wasserstein2,
+    gromov_wasserstein_ipg,
+    gromov_wasserstein_ipg2,
     gromov_barycenters,
     fused_gromov_wasserstein,
     fused_gromov_wasserstein2,
@@ -139,6 +141,8 @@ __all__ = [
     "expected_sliced_plan",
     "gromov_wasserstein",
     "gromov_wasserstein2",
+    "gromov_wasserstein_ipg",
+    "gromov_wasserstein_ipg2",
     "gromov_barycenters",
     "fused_gromov_wasserstein",
     "fused_gromov_wasserstein2",

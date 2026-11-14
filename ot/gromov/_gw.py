@@ -21,6 +21,7 @@ from ..utils import check_marginal, check_random_state, unif
 from ..backend import get_backend, NumpyBackend
 
 from ._utils import init_matrix, gwloss, gwggrad
+from ._utils import _project, _spectral_norm
 from ._utils import update_barycenter_structure, update_barycenter_feature
 
 
@@ -419,6 +420,441 @@ def gromov_wasserstein2(
         return gw, log_gw
     else:
         return gw
+
+
+def gromov_wasserstein_ipg(
+    C1,
+    C2,
+    p=None,
+    q=None,
+    loss_fun="square_loss",
+    symmetric=None,
+    G0=None,
+    max_iter=10000,
+    max_iter_proj=5000,
+    tol=1e-9,
+    iter_check=100,
+    lr_const=1.0,
+    expon=2.1,
+    proj_tol_scale=1.0,
+    proj_lr_const=2.0,
+    adaptive_step=True,
+    verbose=False,
+    log=False,
+):
+    r"""
+    Returns the Gromov-Wasserstein transport between :math:`(\mathbf{C_1}, \mathbf{p})` and :math:`(\mathbf{C_2}, \mathbf{q})`
+    using the Inexact Projected Gradient (IPG) solver of [97]_.
+
+    The function solves the following optimization problem:
+
+    .. math::
+        \mathbf{T}^* \in \mathop{\arg \min}_\mathbf{T} \quad \sum_{i,j,k,l}
+        L(\mathbf{C_1}_{i,k}, \mathbf{C_2}_{j,l}) \mathbf{T}_{i,j} \mathbf{T}_{k,l}
+
+        s.t. \ \mathbf{T} \mathbf{1} &= \mathbf{p}
+
+             \mathbf{T}^T \mathbf{1} &= \mathbf{q}
+
+             \mathbf{T} &\geq 0
+
+    Where :
+
+    - :math:`\mathbf{C_1}`: Metric cost matrix in the source space.
+    - :math:`\mathbf{C_2}`: Metric cost matrix in the target space.
+    - :math:`\mathbf{p}`: Distribution in the source space.
+    - :math:`\mathbf{q}`: Distribution in the target space.
+    - `L`: Loss function to account for the misfit between the similarity matrices.
+
+    In contrast with the conditional gradient solver :func:`ot.gromov.gromov_wasserstein`,
+    each iteration of this solver takes a gradient step on the (nonconvex) GW
+    objective followed by an approximate Euclidean projection of the iterate
+    onto the transport polytope. The projection is never solved exactly: it is
+    computed up to a decreasing accuracy :math:`\text{tol}_{proj} \propto 1/k^{expon}`
+    with a Nesterov-accelerated dual gradient ascent
+    (:func:`ot.gromov.proj_transport_polytope`), and the dual potentials are
+    warm-started between outer iterations. This inexact projected gradient
+    scheme with adaptive (secant) step sizes enjoys global convergence
+    guarantees to a stationary point of the GW problem [97]_ while avoiding
+    the linear OT solver call of conditional gradient approaches. Note that
+    the convergence guarantees of [97]_ are stated for the squared loss.
+
+    .. note:: This function is backend-compatible and will work on arrays from
+        all compatible backends. Contrary to the conditional gradient solver,
+        all computations are performed on the backend of the input arrays, so
+        no copy to CPU is needed for GPU arrays.
+    .. note:: The implementation is a port of the MIT-licensed reference
+        implementation `GWIPG <https://github.com/liangling98/GWIPG>`_
+        (solver `gwipg`), adapted to the POT backend abstraction. The spectral
+        norm of the cost matrices used in the step size is computed through
+        :func:`ot.gromov._utils._spectral_norm`.
+
+    Parameters
+    ----------
+    C1 : array-like, shape (ns, ns)
+        Metric cost matrix in the source space.
+    C2 : array-like, shape (nt, nt)
+        Metric cost matrix in the target space.
+    p : array-like, shape (ns,), optional
+        Distribution in the source space.
+        If let to its default value None, uniform distribution is taken.
+    q : array-like, shape (nt,), optional
+        Distribution in the target space.
+        If let to its default value None, uniform distribution is taken.
+    loss_fun : str, optional
+        Loss function used for the solver either 'square_loss' or 'kl_loss'.
+        Note that the convergence guarantees of [97]_ are given for 'square_loss'.
+    symmetric : bool, optional
+        Either C1 and C2 are to be assumed symmetric or not.
+        If let to its default None value, a symmetry test will be conducted.
+        Else if set to True (resp. False), C1 and C2 will be assumed symmetric (resp. asymmetric).
+    G0: array-like, shape (ns,nt), optional
+        If None, the initial transport plan of the solver is pq^T.
+        Otherwise G0 will be used as initial transport of the solver.
+    max_iter : int, optional
+        Max number of iterations of the outer projected-gradient solver.
+    max_iter_proj : int, optional
+        Max number of iterations of the inner projection solver.
+    tol : float, optional
+        Stop threshold on the absolute change of the coupling (>0).
+    iter_check : int, optional
+        Check the outer stopping criterion every `iter_check` iterations.
+    lr_const : float, optional
+        Initial step size of the outer solver is
+        ``lr_const / (4 * spectral_norm(C1) * spectral_norm(C2))``.
+    expon : float, optional
+        The inner projection accuracy is ``proj_tol_scale / (k+1)**expon`` at
+        outer iteration k.
+    proj_tol_scale : float, optional
+        Scale of the inner projection accuracy (see `expon`).
+    proj_lr_const : float, optional
+        Dual step size of the inner projection is ``proj_lr_const / (ns + nt)``
+        (default 2., the practical value used in the reference implementation;
+        use at most 1 for the safe Lipschitz step of the accelerated dual).
+    adaptive_step : bool, optional
+        Use the adaptive (secant) update of the outer step size proposed in
+        [97]_. If False, a constant step size is used.
+    verbose : bool, optional
+        Print information along iterations.
+    log : bool, optional
+        Record log if True.
+
+    Returns
+    -------
+    T : array-like, shape (`ns`, `nt`)
+        Coupling between the two spaces that minimizes:
+
+            :math:`\sum_{i,j,k,l} L(\mathbf{C_1}_{i,k}, \mathbf{C_2}_{j,l}) \mathbf{T}_{i,j} \mathbf{T}_{k,l}`
+    log : dict
+        Convergence information and loss with keys ``err``, ``loss``,
+        ``gw_dist``, ``T`` and ``n_iter``.
+
+    :ref:`[97] <references-gromov-wasserstein-ipg>`
+
+    .. _references-gromov-wasserstein-ipg:
+
+    References
+    ----------
+    .. [97] Liang, J., & Yang, R. "A Provably Convergent and Practical
+        Algorithm for Gromov-Wasserstein Optimal Transport". Advances in
+        Neural Information Processing Systems (NeurIPS), 2026.
+    """
+    if loss_fun not in ("square_loss", "kl_loss"):
+        raise ValueError(
+            f"Unknown `loss_fun='{loss_fun}'`. Use one of: {'square_loss', 'kl_loss'}."
+        )
+
+    C1, C2 = list_to_array(C1, C2)
+    arr = [C1, C2]
+    if p is not None:
+        arr.append(list_to_array(p))
+    else:
+        p = unif(C1.shape[0], type_as=C1)
+    if q is not None:
+        arr.append(list_to_array(q))
+    else:
+        q = unif(C2.shape[0], type_as=C1)
+    if G0 is not None:
+        arr.append(list_to_array(G0))
+
+    nx = get_backend(*arr)
+
+    if G0 is None:
+        G0 = nx.outer(p, q)
+
+    T = G0
+    constC, hC1, hC2 = init_matrix(C1, C2, p, q, loss_fun, nx)
+
+    if symmetric is None:
+        symmetric = nx.allclose(C1, C1.T, atol=1e-10) and nx.allclose(
+            C2, C2.T, atol=1e-10
+        )
+    if symmetric:
+
+        def df(G):
+            return gwggrad(constC, hC1, hC2, G, nx)
+    else:
+        constCt, hC1t, hC2t = init_matrix(C1.T, C2.T, p, q, loss_fun, nx)
+
+        def df(G):
+            return 0.5 * (
+                gwggrad(constC, hC1, hC2, G, nx)
+                + gwggrad(constCt, hC1t, hC2t, G, nx)
+            )
+
+    # Lipschitz constant of the gradient of the squared-loss GW objective,
+    # computed with backend eigendecompositions (no CPU copy of the costs)
+    lipschitz = 4.0 * float(nx.to_numpy(_spectral_norm(C1, nx))) * float(
+        nx.to_numpy(_spectral_norm(C2, nx))
+    )
+    if not np.isfinite(lipschitz):
+        raise ValueError(
+            "The spectral norms of C1 and C2 are not finite. Please rescale "
+            "the cost matrices."
+        )
+    lr = lr_const / lipschitz if lipschitz > 0 else 1.0
+
+    y = None  # dual potentials of the transport polytope, warm started
+    err = np.inf
+    failures = 0
+    dfT = df(T)
+
+    if log:
+        log = {"err": [], "loss": []}
+
+    cpt = -1
+    for cpt in range(max_iter):
+        if adaptive_step and err < 1e-4 and cpt % 100 == 0 and cpt >= 100:
+            # secant step size update from the previous iterates
+            denom = float(nx.to_numpy(nx.norm(dfT - dfTprev)))
+            num = float(nx.to_numpy(nx.norm(T - Tprev)))
+            candidate = num / denom if denom > 0 else np.nan
+            if np.isfinite(candidate) and candidate > 0:
+                lr = candidate
+
+        Tprev, dfTprev = T, dfT
+        if cpt:
+            dfT = df(Tprev)
+
+        Tin = Tprev - lr * dfT
+        # inexact projection onto the transport polytope with decreasing
+        # accuracy, warm started from the previous dual potentials
+        tol_proj = proj_tol_scale / (cpt + 1) ** expon
+        T, y, stats = _project(
+            Tin,
+            p,
+            q,
+            y,
+            max_iter_proj,
+            tol_proj,
+            nx=nx,
+            lr_const=proj_lr_const,
+        )
+        if not stats["converged"]:
+            failures += 1
+
+        if cpt % iter_check == 0:
+            err = nx.norm(T - Tprev)
+
+            if log or verbose:
+                loss = gwloss(constC, hC1, hC2, T, nx)
+
+            if log:
+                log["err"].append(err)
+                log["loss"].append(loss)
+
+            if verbose:
+                if cpt % (10 * iter_check) == 0:
+                    print(
+                        "{:5s}|{:12s}|{:12s}".format("It.", "Err", "Loss")
+                        + "\n"
+                        + "-" * 35
+                    )
+                print("{:5d}|{:8e}|{:8e}|".format(cpt, err, loss))
+
+            if err <= tol:
+                break
+
+    if failures:
+        warnings.warn(
+            f"{failures} of {cpt + 1} projections did not meet their inner "
+            "residual target. Consider increasing `max_iter_proj`.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    if nx.any(nx.isnan(T)):
+        warnings.warn(
+            "Solver failed to produce a transport plan. You might want to "
+            "decrease `lr_const` or increase `max_iter_proj`.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    if log:
+        log["gw_dist"] = gwloss(constC, hC1, hC2, T, nx)
+        log["T"] = T
+        log["n_iter"] = cpt + 1
+
+        return T, log
+    else:
+        return T
+
+
+def gromov_wasserstein_ipg2(
+    C1,
+    C2,
+    p=None,
+    q=None,
+    loss_fun="square_loss",
+    symmetric=None,
+    G0=None,
+    max_iter=10000,
+    max_iter_proj=5000,
+    tol=1e-9,
+    iter_check=100,
+    lr_const=1.0,
+    expon=2.1,
+    proj_tol_scale=1.0,
+    proj_lr_const=2.0,
+    adaptive_step=True,
+    verbose=False,
+    log=False,
+):
+    r"""
+    Returns the Gromov-Wasserstein loss :math:`\mathbf{GW}` between :math:`(\mathbf{C_1}, \mathbf{p})` and :math:`(\mathbf{C_2}, \mathbf{q})`
+    computed with the Inexact Projected Gradient (IPG) solver of [97]_.
+    To recover the Gromov-Wasserstein distance as defined in [13] compute :math:`d_{GW} = \frac{1}{2} \sqrt{\mathbf{GW}}`.
+
+    The function solves the following optimization problem:
+
+    .. math::
+        \mathbf{GW} = \min_\mathbf{T} \quad \sum_{i,j,k,l}
+        L(\mathbf{C_1}_{i,k}, \mathbf{C_2}_{j,l}) \mathbf{T}_{i,j} \mathbf{T}_{k,l}
+
+        s.t. \ \mathbf{T} \mathbf{1} &= \mathbf{p}
+
+             \mathbf{T}^T \mathbf{1} &= \mathbf{q}
+
+             \mathbf{T} &\geq 0
+
+    Where :
+
+    - :math:`\mathbf{C_1}`: Metric cost matrix in the source space
+    - :math:`\mathbf{C_2}`: Metric cost matrix in the target space
+    - :math:`\mathbf{p}`: distribution in the source space
+    - :math:`\mathbf{q}`: distribution in the target space
+    - `L`: loss function to account for the misfit between the similarity
+      matrices
+
+    See :func:`ot.gromov.gromov_wasserstein_ipg` for a description of the
+    inexact projected gradient algorithm and of the solver parameters.
+
+    .. note:: This function is backend-compatible and will work on arrays from
+        all compatible backends. Contrary to the conditional gradient solver,
+        all computations are performed on the backend of the input arrays, so
+        no copy to CPU is needed for GPU arrays.
+
+    Parameters
+    ----------
+    C1 : array-like, shape (ns, ns)
+        Metric cost matrix in the source space
+    C2 : array-like, shape (nt, nt)
+        Metric cost matrix in the target space
+    p : array-like, shape (ns,), optional
+        Distribution in the source space.
+        If let to its default value None, uniform distribution is taken.
+    q : array-like, shape (nt,), optional
+        Distribution in the target space.
+        If let to its default value None, uniform distribution is taken.
+    loss_fun : str, optional
+        Loss function used for the solver either 'square_loss' or 'kl_loss'.
+        Note that the convergence guarantees of [97]_ are given for 'square_loss'.
+    symmetric : bool, optional
+        Either C1 and C2 are to be assumed symmetric or not.
+        If let to its default None value, a symmetry test will be conducted.
+        Else if set to True (resp. False), C1 and C2 will be assumed symmetric (resp. asymmetric).
+    G0: array-like, shape (ns,nt), optional
+        If None the initial transport plan of the solver is pq^T.
+        Otherwise G0 will be used as initial transport of the solver.
+    max_iter : int, optional
+        Max number of iterations of the outer projected-gradient solver.
+    max_iter_proj : int, optional
+        Max number of iterations of the inner projection solver.
+    tol : float, optional
+        Stop threshold on the absolute change of the coupling (>0).
+    iter_check : int, optional
+        Check the outer stopping criterion every `iter_check` iterations.
+    lr_const : float, optional
+        Initial step size of the outer solver is
+        ``lr_const / (4 * spectral_norm(C1) * spectral_norm(C2))``.
+    expon : float, optional
+        The inner projection accuracy is ``proj_tol_scale / (k+1)**expon`` at
+        outer iteration k.
+    proj_tol_scale : float, optional
+        Scale of the inner accuracy (see `expon`).
+    proj_lr_const : float, optional
+        Dual step size of the inner projection is ``proj_lr_const / (ns + nt)``
+        (default 2., the practical value used in the reference implementation;
+        use at most 1 for the safe Lipschitz step of the accelerated dual).
+    adaptive_step : bool, optional
+        Use the adaptive (secant) update of the outer step size proposed in
+        [97]_. If False, a constant step size is used.
+    verbose : bool, optional
+        Print information along iterations
+    log : bool, optional
+        record log if True
+
+    Returns
+    -------
+    gw_dist : float
+        Gromov-Wasserstein distance
+    log : dict
+        Convergence information and coupling matrix with keys ``err``,
+        ``loss``, ``gw_dist``, ``T`` and ``n_iter``.
+
+    :ref:`[97] <references-gromov-wasserstein-ipg2>`
+
+    .. _references-gromov-wasserstein-ipg2:
+
+    References
+    ----------
+    .. [97] Liang, J., & Yang, R. "A Provably Convergent and Practical
+        Algorithm for Gromov-Wasserstein Optimal Transport". Advances in
+        Neural Information Processing Systems (NeurIPS), 2026.
+
+    .. [13] Mémoli, Facundo. Gromov–Wasserstein distances and the
+        metric approach to object matching. Foundations of computational
+        mathematics 11.4 (2011): 417-487.
+    """
+    T, log_ipg = gromov_wasserstein_ipg(
+        C1,
+        C2,
+        p,
+        q,
+        loss_fun,
+        symmetric,
+        G0=G0,
+        max_iter=max_iter,
+        max_iter_proj=max_iter_proj,
+        tol=tol,
+        iter_check=iter_check,
+        lr_const=lr_const,
+        expon=expon,
+        proj_tol_scale=proj_tol_scale,
+        proj_lr_const=proj_lr_const,
+        adaptive_step=adaptive_step,
+        verbose=verbose,
+        log=True,
+    )
+
+    log_ipg["T"] = T
+    gw_dist = log_ipg["gw_dist"]
+
+    if log:
+        return gw_dist, log_ipg
+    else:
+        return gw_dist
 
 
 def fused_gromov_wasserstein(
